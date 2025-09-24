@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer, AutoModel
 from sklearn.svm import LinearSVC
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.model_selection import train_test_split, learning_curve
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
 import joblib
 
 # =============================
@@ -76,74 +76,82 @@ def phobert_embed(texts, max_length: int = 256, batch_size: int = 16, l2norm: bo
 # =============================
 # 2) Train + Evaluate + Save
 # =============================
-def train_phobert_svm(csv_path: str,
-                      title_col: str = "title",
-                      content_col: str = "content",
-                      label_col: str = "topic",
-                      test_size: float = 0.2,
-                      random_state: int = 42,
-                      batch_size: int = 8,
-                      max_length: int = 256,
-                      C: float = 1.0,
-                      save_dir: str = "phobert_svm_model"):
-    """
-    Train PhoBERT embeddings + LinearSVC.
-    Lưu model, label encoder, test set (text), và train/test embeddings.
-    Trả về: clf, le, X_test_txt, y_test (y_test dạng int).
-    """
-
-    print(f"Run on: {device}")
-
-    # Load data
-    df = pd.read_csv(csv_path)
-    if not {title_col, content_col, label_col}.issubset(df.columns):
-        raise ValueError(f"CSV must contain columns: {title_col}, {content_col}, {label_col}")
-
-    df["text"] = df[title_col].fillna("") + " " + df[content_col].fillna("")
-    texts = df["text"].astype(str).tolist()
-    labels_str = df[label_col].astype(str).tolist()
-
-    # Encode label
-    le = LabelEncoder()
-    y = le.fit_transform(labels_str)
-
-    # Split
-    X_train_txt, X_test_txt, y_train, y_test = train_test_split(
-        texts, y, test_size=test_size, random_state=random_state, stratify=y
-    )
-
-    # Embed & Train
+def prepare_and_save_embeddings(
+    csv_path, 
+    title_col="title", content_col="content", label_col="topic",
+    test_size=0.2, random_state=42, batch_size=8, max_length=256,
+    save_dir="phobert_svm_model"
+):
+    texts, labels = load_data(csv_path, title_col, content_col, label_col)
+    y, le = encode_labels(labels)
+    X_train_txt, X_test_txt, y_train, y_test = split_data(texts, y, test_size, random_state)
     print(">> Embedding train set...")
-    X_train = phobert_embed(X_train_txt, batch_size=batch_size, max_length=max_length)
+    X_train = embed_texts(X_train_txt, batch_size, max_length)
     print(">> Embedding test set...")
-    X_test = phobert_embed(X_test_txt, batch_size=batch_size, max_length=max_length)
-
-    print(">> Training SVM...")
-    clf = LinearSVC(C=C, max_iter=5000)
-    clf.fit(X_train, y_train)
-
-    # Evaluate quick
-    y_pred = clf.predict(X_test)
-    print(">> Evaluation:")
-    print(classification_report(y_test, y_pred, target_names=le.classes_))
-
-    # Save artifacts
+    X_test = embed_texts(X_test_txt, batch_size, max_length)
     os.makedirs(save_dir, exist_ok=True)
-    joblib.dump(clf, f"{save_dir}/svm_model.joblib")
-    joblib.dump(le, f"{save_dir}/label_encoder.joblib")
-    joblib.dump((X_test_txt, y_test), f"{save_dir}/test_set.pkl")
-
     np.save(f"{save_dir}/X_train_emb.npy", X_train)
     np.save(f"{save_dir}/y_train.npy", y_train)
     np.save(f"{save_dir}/X_test_emb.npy",  X_test)
     np.save(f"{save_dir}/y_test.npy",      y_test)
+    # Lưu csv có cả text và label
+    df_train = pd.DataFrame(X_train)
+    df_train.insert(0, "label", y_train)
+    df_train.insert(0, "text", X_train_txt)    
+    df_train.to_csv(f"{save_dir}/X_train_emb.csv", index=False)
+    df_test = pd.DataFrame(X_test)
+    df_test.insert(0, "label", y_test)
+    df_test.insert(0, "text", X_test_txt)
+    df_test.to_csv(f"{save_dir}/X_test_emb.csv", index=False)
+    joblib.dump(le, f"{save_dir}/label_encoder.joblib")
+    print(">> Saved embeddings and texts to", save_dir)
 
-    print(f">> Saved model, encoder, test set and embeddings to {save_dir}/")
-    return clf, le, X_test_txt, y_test
+def train_svm_from_embeddings(
+    save_dir="phobert_svm_model", 
+    C=1.0, max_iter=5000
+):
+    X_train = np.load(f"{save_dir}/X_train_emb.npy")
+    y_train = np.load(f"{save_dir}/y_train.npy")
+    X_test  = np.load(f"{save_dir}/X_test_emb.npy")
+    y_test  = np.load(f"{save_dir}/y_test.npy")
+    le = joblib.load(f"{save_dir}/label_encoder.joblib")
+    clf = LinearSVC(C=C, max_iter=max_iter)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    print(">> Evaluation:")
+    print(classification_report(y_test, y_pred, target_names=le.classes_))
+    joblib.dump(clf, f"{save_dir}/svm_model.joblib")
+    print(">> Saved SVM model to", save_dir)
+    return clf, le, X_test, y_test
 
 # =============================
 # 3) Load + Predict tiện dụng
 # =============================
+def load_data(csv_path, title_col="title", content_col="content", label_col="topic"):
+    df = pd.read_csv(csv_path)
+    if not {title_col, content_col, label_col}.issubset(df.columns):
+        raise ValueError(f"CSV must contain columns: {title_col}, {content_col}, {label_col}")
+    df["text"] = df[title_col].fillna("") + " " + df[content_col].fillna("")
+    texts = df["text"].astype(str).tolist()
+    labels = df[label_col].astype(str).tolist()
+    return texts, labels
+
+def encode_labels(labels):
+    le = LabelEncoder()
+    y = le.fit_transform(labels)
+    return y, le
+
+def split_data(texts, y, test_size=0.2, random_state=42):
+    return train_test_split(texts, y, test_size=test_size, random_state=random_state, stratify=y)
+
+def embed_texts(texts, batch_size=8, max_length=256):
+    return phobert_embed(texts, batch_size=batch_size, max_length=max_length)
+
+def train_svm(X_train, y_train, C=1.0, max_iter=5000):
+    clf = LinearSVC(C=C, max_iter=max_iter)
+    clf.fit(X_train, y_train)
+    return clf
+
 def load_model(save_dir: str = "phobert_svm_model"):
     clf = joblib.load(f"{save_dir}/svm_model.joblib")
     le = joblib.load(f"{save_dir}/label_encoder.joblib")
@@ -314,3 +322,39 @@ def plot_learning_curve_svm(
     plt.fill_between(ts_abs, va_m - va_s, va_m + va_s, alpha=0.15)
     plt.xlabel("Training examples"); plt.ylabel(scoring); plt.title(title)
     plt.legend(); plt.tight_layout(); plt.show()
+
+def plot_roc_multiclass(
+    clf, le, X_emb=None, X_texts=None, y_true_labels=None,
+    batch_size=8, max_length=256,
+    figsize=(8,6), title="ROC (one-vs-rest)", max_classes=10
+):
+    if y_true_labels is None:
+        raise ValueError("Cần y_true_labels (int hoặc tên lớp).")
+    if isinstance(y_true_labels[0], str):
+        y_true = le.transform(y_true_labels)
+    else:
+        y_true = np.asarray(y_true_labels, dtype=int)
+
+    X = _ensure_embeddings(X_emb=X_emb, X_texts=X_texts,
+                           batch_size=batch_size, max_length=max_length)
+
+    scores = clf.decision_function(X)
+    if scores.ndim == 1:
+        scores = np.vstack([-scores, scores]).T
+
+    y_bin = label_binarize(y_true, classes=np.arange(scores.shape[1]))
+
+    plt.figure(figsize=figsize)
+    fpr_micro, tpr_micro, _ = roc_curve(y_bin.ravel(), scores.ravel())
+    auc_micro = auc(fpr_micro, tpr_micro)
+    plt.plot(fpr_micro, tpr_micro, linestyle="--", label=f"micro-average AUC = {auc_micro:.3f}")
+
+    classes = np.arange(min(scores.shape[1], max_classes))
+    for c in classes:
+        fpr, tpr, _ = roc_curve(y_bin[:, c], scores[:, c])
+        plt.plot(fpr, tpr, alpha=0.8, label=f"{le.classes_[c]} (AUC={auc(fpr,tpr):.3f})")
+
+    plt.plot([0,1],[0,1],"k--",lw=1)
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title(title); plt.legend(loc="lower right", fontsize=8)
+    plt.tight_layout(); plt.show()
