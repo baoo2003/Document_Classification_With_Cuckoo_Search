@@ -147,7 +147,7 @@ class CSO:
         Xnew = self.X.copy()
         Xold = self.X.copy()
         for i in range(self.P):
-            d1,d2 = np.random.randint(0,5,2)
+            d1,d2 = np.random.randint(0,self.P,2)
             for j in range(self.n):
                 r = np.random.rand()
                 if r < self.pa:
