@@ -1,6 +1,11 @@
 import string
 import unicodedata
 from underthesea import text_normalize, word_tokenize
+from bs4 import BeautifulSoup
+
+def remove_html_tags(text: str) -> str:
+    soup = BeautifulSoup(text, "html.parser")
+    return soup.get_text()
 
 def remove_punctuation(text: str) -> str:
     result = text.translate(str.maketrans(string.punctuation, ' '*len(string.punctuation)))
@@ -25,6 +30,7 @@ def stopword_removal(text: str, stopwords: set) -> str:
     return ' '.join(filtered_words)
 
 def preprocess_text(text: str, stopwords: set) -> str:
+    text = remove_html_tags(text)
     text = to_lower(text)
     text = remove_punctuation(text)
     text = standardize_unicode(text)
