@@ -358,3 +358,16 @@ def plot_roc_multiclass(
     plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
     plt.title(title); plt.legend(loc="lower right", fontsize=8)
     plt.tight_layout(); plt.show()
+
+def embed_and_save_simple(
+    csv_path: str,
+    out_path: str = "embeds.npy",
+    batch_size: int = 16,
+    max_length: int = 256
+):
+    """Đọc file CSV, ghép title + content, embed PhoBERT và lưu .npy"""
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    texts = (df["title"].fillna("") + " " + df["description"].fillna("") + " " + df["content"].fillna("")).tolist()
+    X = phobert_embed(texts, batch_size=batch_size, max_length=max_length)
+    np.save(out_path, X)
+    print(f"✅ Saved embeddings {X.shape} -> {out_path}")

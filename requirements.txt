@@ -5,9 +5,9 @@ scikit-learn==1.7.2
 joblib==1.4.2
 
 # chạy với cpu
-# torch == 2.7.1
-# torchvision==0.22.1
-# torchaudio==2.7.1
+torch == 2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 
 # Để chạy với gpu:
 # pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
