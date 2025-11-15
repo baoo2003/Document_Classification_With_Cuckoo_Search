@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer, AutoModel
-from sklearn.svm import LinearSVC
+from sklearn.svm import SVC
 from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.model_selection import train_test_split, learning_curve
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
@@ -80,20 +80,25 @@ def prepare_and_save_embeddings(
     csv_path, 
     title_col="title", content_col="content", label_col="topic",
     test_size=0.2, random_state=42, batch_size=8, max_length=256,
-    save_dir="phobert_svm_model"
+    save_dir="models/svm"
 ):
     texts, labels = load_data(csv_path, title_col, content_col, label_col)
+
     y, le = encode_labels(labels)
-    X_train_txt, X_test_txt, y_train, y_test = split_data(texts, y, test_size, random_state)
+
+    X_train_txt, X_test_txt, y_train, y_test = train_test_split(texts, y, test_size=test_size, random_state=random_state, stratify=y)
+
     print(">> Embedding train set...")
-    X_train = embed_texts(X_train_txt, batch_size, max_length)
+    X_train = phobert_embed(X_train_txt, batch_size=batch_size, max_length=max_length)
     print(">> Embedding test set...")
-    X_test = embed_texts(X_test_txt, batch_size, max_length)
+    X_test = phobert_embed(X_test_txt, batch_size=batch_size, max_length=max_length)
+
     os.makedirs(save_dir, exist_ok=True)
     np.save(f"{save_dir}/X_train_emb.npy", X_train)
     np.save(f"{save_dir}/y_train.npy", y_train)
-    np.save(f"{save_dir}/X_test_emb.npy",  X_test)
-    np.save(f"{save_dir}/y_test.npy",      y_test)
+    np.save(f"{save_dir}/X_test_emb.npy", X_test)
+    np.save(f"{save_dir}/y_test.npy", y_test)
+
     # Lưu csv có cả text và label
     df_train = pd.DataFrame(X_train)
     df_train.insert(0, "label", y_train)
@@ -106,22 +111,28 @@ def prepare_and_save_embeddings(
     joblib.dump(le, f"{save_dir}/label_encoder.joblib")
     print(">> Saved embeddings and texts to", save_dir)
 
-def train_svm_from_embeddings(
-    save_dir="phobert_svm_model", 
-    C=1.0, max_iter=5000
-):
+def train_svm_base(
+    save_dir="models/svm",
+    model_file_name="svm_model",
+    kernel="linear",
+    max_iter=3000
+):    
     X_train = np.load(f"{save_dir}/X_train_emb.npy")
     y_train = np.load(f"{save_dir}/y_train.npy")
     X_test  = np.load(f"{save_dir}/X_test_emb.npy")
     y_test  = np.load(f"{save_dir}/y_test.npy")
     le = joblib.load(f"{save_dir}/label_encoder.joblib")
-    clf = LinearSVC(C=C, max_iter=max_iter)
+
+    clf = SVC(kernel=kernel, max_iter=max_iter)
     clf.fit(X_train, y_train)
+
     y_pred = clf.predict(X_test)
     print(">> Evaluation:")
     print(classification_report(y_test, y_pred, target_names=le.classes_))
-    joblib.dump(clf, f"{save_dir}/svm_model.joblib")
-    print(">> Saved SVM model to", save_dir)
+
+    joblib.dump(clf, f"{save_dir}/{model_file_name}.joblib")
+    print(f">> Saved SVM model to {save_dir}/{model_file_name}.joblib")
+
     return clf, le, X_test, y_test
 
 # =============================
@@ -140,33 +151,6 @@ def encode_labels(labels):
     le = LabelEncoder()
     y = le.fit_transform(labels)
     return y, le
-
-def split_data(texts, y, test_size=0.2, random_state=42):
-    return train_test_split(texts, y, test_size=test_size, random_state=random_state, stratify=y)
-
-def embed_texts(texts, batch_size=8, max_length=256):
-    return phobert_embed(texts, batch_size=batch_size, max_length=max_length)
-
-def train_svm(X_train, y_train, C=1.0, max_iter=5000):
-    clf = LinearSVC(C=C, max_iter=max_iter)
-    clf.fit(X_train, y_train)
-    return clf
-
-def load_model(save_dir: str = "phobert_svm_model"):
-    clf = joblib.load(f"{save_dir}/svm_model.joblib")
-    le = joblib.load(f"{save_dir}/label_encoder.joblib")
-    return clf, le
-
-def load_test_set(save_dir: str = "phobert_svm_model"):
-    """Load lại X_test_txt, y_test (int) đã lưu lúc train."""
-    return joblib.load(f"{save_dir}/test_set.pkl")
-
-def load_embeddings(save_dir: str = "phobert_svm_model"):
-    X_train = np.load(f"{save_dir}/X_train_emb.npy")
-    y_train = np.load(f"{save_dir}/y_train.npy")
-    X_test  = np.load(f"{save_dir}/X_test_emb.npy")
-    y_test  = np.load(f"{save_dir}/y_test.npy")
-    return X_train, y_train, X_test, y_test
 
 def predict_topic(title: str, content: str, clf, le,
                   batch_size: int = 8, max_length: int = 256) -> str:
@@ -192,6 +176,19 @@ def _ensure_embeddings(X_emb=None, X_texts=None, batch_size: int = 8, max_length
     if X_texts is None:
         raise ValueError("Cần truyền X_emb hoặc X_texts.")
     return phobert_embed(X_texts, batch_size=batch_size, max_length=max_length)
+
+def embed_and_save_simple(
+    csv_path: str,
+    out_path: str = "embeds.npy",
+    batch_size: int = 16,
+    max_length: int = 256
+):
+    """Đọc file CSV, ghép title + content, embed PhoBERT và lưu .npy"""
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    texts = (df["title"].fillna("") + " " + df["description"].fillna("") + " " + df["content"].fillna("")).tolist()
+    X = phobert_embed(texts, batch_size=batch_size, max_length=max_length)
+    np.save(out_path, X)
+    print(f"✅ Saved embeddings {X.shape} -> {out_path}")
 
 # =============================
 # 4) Visualization (matplotlib)
@@ -358,16 +355,3 @@ def plot_roc_multiclass(
     plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
     plt.title(title); plt.legend(loc="lower right", fontsize=8)
     plt.tight_layout(); plt.show()
-
-def embed_and_save_simple(
-    csv_path: str,
-    out_path: str = "embeds.npy",
-    batch_size: int = 16,
-    max_length: int = 256
-):
-    """Đọc file CSV, ghép title + content, embed PhoBERT và lưu .npy"""
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
-    texts = (df["title"].fillna("") + " " + df["description"].fillna("") + " " + df["content"].fillna("")).tolist()
-    X = phobert_embed(texts, batch_size=batch_size, max_length=max_length)
-    np.save(out_path, X)
-    print(f"✅ Saved embeddings {X.shape} -> {out_path}")
