@@ -22,5 +22,6 @@ hf_xet==1.1.10
 umap-learn
 
 # Hỗ trợ api
-fastapi==0.115.5 "uvicorn[standard]==0.30.6"
+fastapi==0.115.5
+uvicorn[standard]==0.30.6
 beautifulsoup4
