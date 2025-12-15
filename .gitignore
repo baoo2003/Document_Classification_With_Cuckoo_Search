@@ -6,3 +6,13 @@ __pycache__/
 
 models/**
 models
+
+certs
+
+check_date.py
+count_article_by_year.py
+
+print_result_opt.py
+
+import_data_to_db.py
+thanhnien_articles_topic_sampled.csv

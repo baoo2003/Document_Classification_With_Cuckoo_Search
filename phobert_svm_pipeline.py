@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from typing import List, Tuple
 
 from transformers import AutoTokenizer, AutoModel
 from sklearn.svm import SVC
@@ -114,7 +115,7 @@ def prepare_and_save_embeddings(
 def train_svm_base(
     save_dir="models/svm",
     model_file_name="svm_model",
-    kernel="linear",
+    kernel="rbf",
     max_iter=3000
 ):    
     X_train = np.load(f"{save_dir}/X_train_emb.npy")
@@ -152,12 +153,51 @@ def encode_labels(labels):
     y = le.fit_transform(labels)
     return y, le
 
-def predict_topic(title: str, content: str, clf, le,
-                  batch_size: int = 8, max_length: int = 256) -> str:
+def predict_topic(
+    title: str,
+    content: str,
+    clf,
+    le,
+    batch_size: int = 8,
+    max_length: int = 256,
+) -> List[Tuple[str, float]]:
+    """
+    Trả về DANH SÁCH (label, confidence) đã sort giảm dần.
+    - label: str (tên nhãn thật sau khi inverse từ LabelEncoder)
+    - confidence: float (xác suất hoặc score chuẩn hoá)
+    """
+
     text = (title or "") + " " + (content or "")
+    text = text.strip()
+
+    # Lấy embedding PhoBERT (shape: (1, hidden_size))
     vec = phobert_embed([text], batch_size=batch_size, max_length=max_length)
-    pred = clf.predict(vec)[0]
-    return le.inverse_transform([pred])[0]
+
+    # Nếu SVM có predict_proba → dùng luôn
+    if hasattr(clf, "predict_proba"):
+        proba = clf.predict_proba(vec)[0]  # shape: (num_classes,)
+    else:
+        # Fallback: dùng decision_function rồi chuẩn hoá giống softmax
+        scores = clf.decision_function(vec)[0]  # (num_classes,) hoặc scalar
+        if np.ndim(scores) == 0:
+            scores = np.array([scores])
+        scores = scores.astype(float)
+        scores = scores - np.max(scores)
+        exp_scores = np.exp(scores)
+        proba = exp_scores / exp_scores.sum()
+
+    # clf.classes_ là các giá trị target đã encode (vd: 0,1,2,...)
+    class_indices = clf.classes_
+    # labels thật string:
+    labels = le.inverse_transform(class_indices)
+
+    # Sắp xếp theo xác suất giảm dần
+    order = np.argsort(proba)[::-1]
+    sorted_labels = labels[order]
+    sorted_proba = proba[order]
+
+    # Trả về list[(label, confidence)]
+    return list(zip(sorted_labels.tolist(), sorted_proba.astype(float).tolist()))
 
 def predict_title_content_batch(titles, contents, clf, le,
                                 batch_size: int = 8, max_length: int = 256):

@@ -8,12 +8,12 @@ from contextlib import asynccontextmanager
 from phobert_svm_pipeline import predict_topic
 from proccessvitext import *
 
-MODEL_DIR = os.getenv("MODEL_DIR", "models/phobert_svm_model")
+MODEL_DIR = os.getenv("MODEL_DIR", "models/svm")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.clf = joblib.load(MODEL_DIR + "/svm_cso_optimized.joblib")
+    app.state.clf = joblib.load(MODEL_DIR + "/svm_cso_optimized_2.joblib")
     app.state.le = joblib.load(MODEL_DIR + "/label_encoder.joblib")
     yield
 
@@ -24,8 +24,14 @@ class InText(BaseModel):
     title: Optional[str] = ""
     content: str
 
-class Out(BaseModel):
+class LabelScore(BaseModel):
     label: str
+    confidence: float
+
+class Out(BaseModel):
+    label_best: str
+    confidence_best: float
+    candidates: List[LabelScore]
     latency_ms: int
 
 @app.get("/health")
@@ -40,12 +46,43 @@ def predict(p: InText):
     print("Received payload:", p)
     print("Original title:", p.title)
     print("Original content:", p.content)
-    p.title = preprocess_topic(p.title)
-    p.content = preprocess_text(p.content, set())
+
+    # Tiền xử lý
+    p.title = preprocess_text(p.title)
+    p.content = preprocess_text(p.content)
+
     print("Preprocessed title:", p.title)
     print("Preprocessed content:", p.content)
-    lbl = predict_topic(p.title or "", p.content or "", app.state.clf, app.state.le)
-    return {"label": lbl, "latency_ms": int((time.time()-t)*1000)}
+
+    # predict_topic giờ trả về list[(label, confidence)]
+    scores = predict_topic(
+        p.title or "",
+        p.content or "",
+        app.state.clf,
+        app.state.le,
+    )
+
+    if not scores:
+        return {
+            "label_best": "",
+            "confidence_best": 0.0,
+            "candidates": [],
+            "latency_ms": int((time.time() - t) * 1000),
+        }
+
+    best_label, best_conf = scores[0]
+
+    candidates = [
+        {"label": label, "confidence": float(conf)}
+        for label, conf in scores
+    ]
+
+    return {
+        "label_best": best_label,
+        "confidence_best": float(best_conf),
+        "candidates": candidates,
+        "latency_ms": int((time.time() - t) * 1000),
+    }
 
 @app.post("/predict-batch")
 def batch(payload: List[InText]):
