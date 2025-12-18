@@ -1,6 +1,7 @@
 .venv
 models/**
-dataset/**
+data/**
+vncorenlp/**
 __pycache__/
 *.pyc
 

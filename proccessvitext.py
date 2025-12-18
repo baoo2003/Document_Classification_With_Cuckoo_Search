@@ -1,7 +1,8 @@
 import string
 import unicodedata
-from underthesea import text_normalize, word_tokenize
+from underthesea import text_normalize
 from bs4 import BeautifulSoup
+from vncorenlp import VnCoreNLP
 
 def remove_html_tags(text: str) -> str:
     soup = BeautifulSoup(text, "html.parser")
@@ -21,9 +22,6 @@ def normalize_text(text: str) -> str:
     text = text_normalize(text)
     return text
 
-def split_words(text: str) -> list[str]:
-    return word_tokenize(text, format="text")
-
 def stopword_removal(text: str, stopwords: set) -> str:
     words = text.split()
     filtered_words = [word for word in words if word not in stopwords]
@@ -35,13 +33,15 @@ def preprocess_text(text: str, stopwords: set) -> str:
     text = remove_punctuation(text)
     text = standardize_unicode(text)
     text = normalize_text(text)
-    text = split_words(text)
+    
     text = stopword_removal(text, stopwords)
     return text
 
-def preprocess_topic(text: str) -> str:
-    text = to_lower(text)
-    text = remove_punctuation(text)
-    text = standardize_unicode(text)
-    text = normalize_text(text)
-    return text
+if __name__ == "__main__":
+    annotator = VnCoreNLP("vncorenlp/VnCoreNLP-1.2.jar", annotators="wseg")
+
+    words = "Ông Nguyễn Khắc Chúc  đang làm việc tại Đại học Quốc gia Hà Nội. Bà Lan, vợ ông Chúc, cũng làm việc tại đây."
+    result = annotator.tokenize(words)
+    print(result)
+
+    annotator.close()
