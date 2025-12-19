@@ -1,25 +1,32 @@
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModel
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 import numpy as np
 from typing import List, Tuple, Optional
-
+import os
+from sklearn.preprocessing import LabelEncoder
+import pandas as pd
+from tqdm.auto import tqdm
+from torch.cuda.amp.grad_scaler import GradScaler
+from torch.cuda.amp.autocast_mode import autocast
 
 class PhoBERTClassifier(nn.Module):
     """
     PhoBERT-based text classifier for Vietnamese news classification
     
-    Kiến trúc:
-    - PhoBERT (pre-trained): Trích xuất đặc trưng từ văn bản tiếng Việt
-    - Fully Connected Layer: Lớp phân loại với dropout để tránh overfitting
-    - Sigmoid/Softmax: Activation function cho output
+    Kiến trúc (Custom Architecture):
+    - PhoBERT (pre-trained): Trích xuất đặc trưng (last_hidden_state của token [CLS])
+    - Dropout: Giảm overfitting
+    - Linear: Classification Head (hidden_size -> num_classes)
     """
     
     def __init__(
         self, 
         num_classes: int,
         phobert_model: str = 'vinai/phobert-base',
-        dropout_rate: float = 0.3,
+        local_dir: str = 'models/phobert-base',
+        dropout_rate: float = 0.1,
         hidden_size: int = 768,
         freeze_phobert: bool = False
     ):
@@ -29,28 +36,34 @@ class PhoBERTClassifier(nn.Module):
         Args:
             num_classes: Số lượng class cần phân loại
             phobert_model: Tên model PhoBERT từ HuggingFace
-            dropout_rate: Tỉ lệ dropout để tránh overfitting
-            hidden_size: Kích thước hidden layer từ PhoBERT (768 cho base, 1024 cho large)
+            dropout_rate: Tỉ lệ dropout
+            hidden_size: Kích thước hidden layer của PhoBERT (768 cho base)
             freeze_phobert: Có đóng băng trọng số PhoBERT hay không
         """
         super(PhoBERTClassifier, self).__init__()
         
-        # Load pre-trained PhoBERT model
-        self.phobert = AutoModel.from_pretrained(phobert_model)
+        # Load pre-trained PhoBERT model (Base model)
+        config_path = os.path.join(local_dir, 'config.json')
+        if os.path.exists(config_path):
+            print(f">> Loading PhoBERT model from local: {local_dir}")
+            self.phobert = AutoModel.from_pretrained(
+                local_dir, 
+                local_files_only=True
+            )
+        else:
+            print(f">> Downloading PhoBERT model from HuggingFace: {phobert_model}")
+            os.makedirs(local_dir, exist_ok=True)
+            self.phobert = AutoModel.from_pretrained(phobert_model)
+            self.phobert.save_pretrained(local_dir)
         
-        # Freeze PhoBERT parameters if needed (chỉ train FC layer)
+        # Custom Classification Head
+        self.dropout = nn.Dropout(dropout_rate)
+        self.classifier = nn.Linear(hidden_size, num_classes)
+        
+        # Freeze PhoBERT parameters if needed
         if freeze_phobert:
             for param in self.phobert.parameters():
                 param.requires_grad = False
-        
-        # Fully Connected Layer cho phân loại
-        # PhoBERT -> FC Layer -> Output
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(hidden_size, num_classes)
-        
-        # Initialize weights
-        nn.init.xavier_normal_(self.fc.weight)
-        nn.init.zeros_(self.fc.bias)
         
         self.num_classes = num_classes
         
@@ -69,23 +82,19 @@ class PhoBERTClassifier(nn.Module):
         Returns:
             logits: Output scores cho mỗi class (batch_size, num_classes)
         """
-        # 1. PhoBERT encoding
-        # outputs[0]: last hidden state (batch_size, seq_length, hidden_size)
-        # outputs[1]: pooled output - [CLS] token representation (batch_size, hidden_size)
+        # Get PhoBERT outputs
         outputs = self.phobert(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
         
-        # 2. Lấy representation từ [CLS] token (token đầu tiên)
-        # Theo Figure 2: final layer representation matching to the token
-        pooled_output = outputs.pooler_output  # (batch_size, hidden_size)
+        # Extract [CLS] token representation (first token)
+        # last_hidden_state shape: (batch_size, seq_len, hidden_size)
+        cls_output = outputs.last_hidden_state[:, 0, :]
         
-        # 3. Dropout để regularization
-        pooled_output = self.dropout(pooled_output)
-        
-        # 4. Fully Connected Layer để phân loại
-        logits = self.fc(pooled_output)  # (batch_size, num_classes)
+        # Apply dropout and classifier
+        x = self.dropout(cls_output)
+        logits = self.classifier(x)
         
         return logits
 
@@ -101,6 +110,7 @@ class PhoBERTTextPreprocessor:
     def __init__(
         self, 
         phobert_model: str = 'vinai/phobert-base',
+        local_dir: str = 'models/phobert-base',
         max_length: int = 128
     ):
         """
@@ -112,19 +122,27 @@ class PhoBERTTextPreprocessor:
                        - 128: Đủ cho title bài báo
                        
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(phobert_model)
+        # Kiểm tra xem local directory có file tokenizer_config.json không
+        tokenizer_config_path = os.path.join(local_dir, 'tokenizer_config.json')
+        if os.path.exists(tokenizer_config_path):
+            print(f">> Loading PhoBERT tokenizer from local: {local_dir}")
+            self.tokenizer = AutoTokenizer.from_pretrained(local_dir, local_files_only=True)
+        else:
+            print(f">> Downloading PhoBERT tokenizer from HuggingFace: {phobert_model}")
+            os.makedirs(local_dir, exist_ok=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(phobert_model)
+            self.tokenizer.save_pretrained(local_dir)
         self.max_length = max_length
     
     def encode_texts(
         self, 
         texts: List[str],
-        padding: bool = True,
+        padding: str = 'max_length',
         truncation: bool = True,
         return_tensors: str = 'pt'
     ) -> dict:
         """
         Encode danh sách văn bản thành tokens
-        Tương ứng với bước "Encode" trong Figure 2
         
         Args:
             texts: Danh sách văn bản đã được tiền xử lý cần encode
@@ -150,136 +168,197 @@ class PhoBERTTextPreprocessor:
 class PhoBERTTrainer:
     """
     Trainer để huấn luyện PhoBERT Classifier
-    Sử dụng Binary Cross-Entropy Loss như trong công thức (1) của Figure 2
+    Sử dụng Cross-Entropy Loss (Standard cho Multi-class Classification)
     """
     
     def __init__(
         self,
         model: PhoBERTClassifier,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device: str = 'cuda'
     ):
         """
         Khởi tạo trainer
         
         Args:
             model: PhoBERT classifier model
-            device: Device để train (cuda/cpu)
+            device: Device để train (mặc định là cuda)
         """
         self.model = model.to(device)
         self.device = device
         
-        # Loss function
-        # Binary Cross-Entropy với Sigmoid activation
-        if model.num_classes == 2:
-            # Binary classification
-            self.criterion = nn.BCEWithLogitsLoss()
-        else:
-            # Multi-class classification
-            self.criterion = nn.CrossEntropyLoss()
+        # Tối ưu hóa cho CUDA
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+        
+        # Sử dụng CrossEntropyLoss cho bài toán Multi-class (13 classes)
+        # Hàm này đã tích hợp sẵn LogSoftmax + NLLLoss
+        # Tự động xử lý việc tính Softmax bên trong
+        self.criterion = nn.CrossEntropyLoss()
     
     def train_epoch(
         self,
         train_loader,
         optimizer,
-        scheduler=None
+        scheduler=None,
+        accumulation_steps: int = 1,
+        use_mixed_precision: bool = True,
+        max_grad_norm: float = 1.0,
+        show_progress: bool = True
     ) -> Tuple[float, float]:
         """
         Train model trong một epoch
-        
-        Args:
-            train_loader: DataLoader cho training data
-            optimizer: Optimizer (Adam, AdamW, etc.)
-            scheduler: Learning rate scheduler (optional)
-            
-        Returns:
-            avg_loss: Loss trung bình
-            avg_acc: Accuracy trung bình
         """
         self.model.train()
         total_loss = 0
         correct = 0
         total = 0
+        optimizer.zero_grad(set_to_none=True)
         
-        for batch in train_loader:
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            labels = batch['labels'].to(self.device)
+        # Mixed precision scaler
+        scaler = GradScaler() if use_mixed_precision else None
+        
+        progress_bar = tqdm(train_loader, desc="Training", ncols=100) if show_progress else train_loader
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
+            labels = batch['labels'].to(self.device, non_blocking=True)
             
             # Forward pass
-            optimizer.zero_grad()
-            logits = self.model(input_ids, attention_mask)
-            
-            # Calculate loss
-            if self.model.num_classes == 2:
-                loss = self.criterion(logits.squeeze(), labels.float())
-                predictions = (torch.sigmoid(logits.squeeze()) > 0.5).long()
+            if scaler:
+                with autocast():
+                    logits = self.model(input_ids, attention_mask)
+                    loss = self.criterion(logits, labels)
             else:
+                logits = self.model(input_ids, attention_mask)
                 loss = self.criterion(logits, labels)
-                predictions = torch.argmax(logits, dim=1)
+            
+            # Gradient accumulation
+            if accumulation_steps > 1:
+                loss = loss / accumulation_steps
             
             # Backward pass
-            loss.backward()
-            optimizer.step()
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
-            if scheduler:
-                scheduler.step()
+            # Update weights
+            if (batch_idx + 1) % accumulation_steps == 0:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
+                    optimizer.step()
+                
+                if scheduler:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
             
             # Statistics
-            total_loss += loss.item()
+            total_loss += loss.item() * accumulation_steps
+            predictions = torch.argmax(logits, dim=1)
             correct += (predictions == labels).sum().item()
             total += labels.size(0)
+            
+            # Update progress bar
+            if show_progress:
+                current_lr = scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]['lr']
+                progress_bar.set_postfix({
+                    'loss': f'{total_loss / (batch_idx + 1):.4f}',
+                    'acc': f'{correct / total:.4f}',
+                    'lr': f'{current_lr:.2e}'
+                })
         
         avg_loss = total_loss / len(train_loader)
         avg_acc = correct / total
         
         return avg_loss, avg_acc
-    
+
     def evaluate(
         self,
-        val_loader
+        val_loader,
+        show_progress: bool = False,
+        use_mixed_precision: bool = True
     ) -> Tuple[float, float]:
         """
         Evaluate model trên validation set
-        
-        Args:
-            val_loader: DataLoader cho validation data
-            
-        Returns:
-            avg_loss: Loss trung bình
-            avg_acc: Accuracy trung bình
         """
         self.model.eval()
         total_loss = 0
         correct = 0
         total = 0
         
+        progress_bar = tqdm(val_loader, desc="Validating", ncols=100) if show_progress else val_loader
+    
         with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+            for batch in progress_bar:
+                input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+                attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
+                labels = batch['labels'].to(self.device, non_blocking=True)
                 
                 # Forward pass
-                logits = self.model(input_ids, attention_mask)
-                
-                # Calculate loss
-                if self.model.num_classes == 2:
-                    loss = self.criterion(logits.squeeze(), labels.float())
-                    predictions = (torch.sigmoid(logits.squeeze()) > 0.5).long()
+                if use_mixed_precision:
+                    with autocast():
+                        logits = self.model(input_ids, attention_mask)
+                        loss = self.criterion(logits, labels)
                 else:
+                    logits = self.model(input_ids, attention_mask)
                     loss = self.criterion(logits, labels)
-                    predictions = torch.argmax(logits, dim=1)
+                
+                # Calculate predictions
+                predictions = torch.argmax(logits, dim=1)
                 
                 # Statistics
                 total_loss += loss.item()
                 correct += (predictions == labels).sum().item()
                 total += labels.size(0)
-        
+                
+                if show_progress:
+                    progress_bar.set_postfix({
+                        'loss': f'{total_loss / (total / labels.size(0)):.4f}',
+                        'acc': f'{correct / total:.4f}'
+                    })
+    
         avg_loss = total_loss / len(val_loader)
         avg_acc = correct / total
         
         return avg_loss, avg_acc
     
+    def predict_from_loader(
+        self,
+        loader,
+        use_mixed_precision: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Predict labels cho toàn bộ dataset trong loader
+        """
+        self.model.eval()
+        all_preds = []
+        all_labels = []
+            
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Predicting", leave=False):
+                input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+                attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
+                labels = batch['labels'].to(self.device, non_blocking=True)
+                
+                if use_mixed_precision:
+                    with autocast():
+                        logits = self.model(input_ids, attention_mask)
+                else:
+                    logits = self.model(input_ids, attention_mask)
+                
+                preds = torch.argmax(logits, dim=1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+        return np.array(all_preds), np.array(all_labels)
+
     def predict(
         self,
         texts: List[str],
@@ -313,330 +392,68 @@ class PhoBERTTrainer:
             with torch.no_grad():
                 logits = self.model(input_ids, attention_mask)
                 
-                if self.model.num_classes == 2:
-                    predictions = (torch.sigmoid(logits.squeeze()) > 0.5).long()
-                else:
-                    predictions = torch.argmax(logits, dim=1)
+                predictions = torch.argmax(logits, dim=1)
                 
                 all_predictions.extend(predictions.cpu().numpy())
         
         return np.array(all_predictions)
 
 
-# Example usage
-if __name__ == "__main__":
-    """
-    Ví dụ sử dụng PhoBERT cho phân loại tin tức tiếng Việt
-    """
-    
-    # 1. Khởi tạo preprocessor
-    print("=== Bước 1: Khởi tạo Preprocessor ===")
-    preprocessor = PhoBERTTextPreprocessor(
-        phobert_model='vinai/phobert-base',
-        max_length=128
-    )
-    
-    # 2. Khởi tạo model
-    print("=== Bước 2: Khởi tạo PhoBERT Classifier ===")
-    num_classes = 13  # Ví dụ: 13 categories tin tức
-    model = PhoBERTClassifier(
-        num_classes=num_classes,
-        phobert_model='vinai/phobert-base',
-        dropout_rate=0.3,
-        hidden_size=768,
-        freeze_phobert=False  # False: train cả PhoBERT, True: chỉ train FC layer
-    )
-    
-    print(f"Model architecture:\n{model}")
-    print(f"\nTotal parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    
-    # 3. Ví dụ encode text
-    print("\n=== Bước 3: Ví dụ Preprocessing và Encoding ===")
-    sample_texts = [
-        "Việt Nam đã giành chiến thắng trong trận đấu bóng đá quan trọng.",
-        "Chính phủ công bố chính sách mới về phát triển kinh tế số."
-    ]
-    
-    encoding = preprocessor.encode_texts(sample_texts)
-    print(f"Input IDs shape: {encoding['input_ids'].shape}")
-    print(f"Attention Mask shape: {encoding['attention_mask'].shape}")
-    
-    # 4. Forward pass demo
-    print("\n=== Bước 4: Ví dụ Forward Pass ===")
-    model.eval()
-    with torch.no_grad():
-        logits = model(encoding['input_ids'], encoding['attention_mask'])
-        print(f"Output logits shape: {logits.shape}")
-        print(f"Predicted classes: {torch.argmax(logits, dim=1)}")
-    
-    print("\n=== Setup hoàn tất! ===")
-    print("Bạn có thể sử dụng PhoBERTTrainer để train model trên dataset của bạn.")
-    
-    # ========================================
-    # DEMO: TRAINING VỚI DATASET THỰC
-    # ========================================
-    # print("\n" + "="*60)
-    # print("DEMO: HUẤN LUYỆN MODEL VỚI DATASET UIT-ViON")
-    # print("="*60)
-    
-    # import pandas as pd
-    # from torch.utils.data import Dataset, DataLoader
-    # from sklearn.preprocessing import LabelEncoder
-    
-    # # ======================
-    # # 1. TẠO CUSTOM DATASET
-    # # ======================
-    # class VietnameseNewsDataset(Dataset):
-    #     """
-    #     Custom Dataset cho Vietnamese News Classification
-    #     """
-    #     def __init__(
-    #         self, 
-    #         csv_file: str,
-    #         preprocessor: PhoBERTTextPreprocessor,
-    #         label_encoder: Optional[LabelEncoder] = None
-    #     ):
-    #         """
-    #         Args:
-    #             csv_file: Path đến file CSV (có columns: title, label)
-    #             preprocessor: PhoBERTTextPreprocessor để encode texts
-    #             label_encoder: LabelEncoder để encode labels (None sẽ tự tạo mới)
-    #         """
-    #         self.data = pd.read_csv(csv_file)
-    #         self.preprocessor = preprocessor
+class VietnameseNewsDataset(Dataset):
+        """
+        Custom Dataset cho Vietnamese News Classification
+        """
+        def __init__(
+            self, 
+            csv_file: str,
+            preprocessor: PhoBERTTextPreprocessor,
+            label_encoder: Optional[LabelEncoder] = None,
+            max_header_length: int = 20
+        ):
+            """
+            Args:
+                csv_file: Path đến file CSV (có columns: title, label)
+                preprocessor: PhoBERTTextPreprocessor để encode texts
+                label_encoder: LabelEncoder để encode labels (None sẽ tự tạo mới)
+                max_header_length: Độ dài tối đa của header (title) tính theo từ
+            """
+            self.data = pd.read_csv(csv_file)
+            self.preprocessor = preprocessor
             
-    #         # Encode labels
-    #         if label_encoder is None:
-    #             self.label_encoder = LabelEncoder()
-    #             self.labels = self.label_encoder.fit_transform(self.data['label'])
-    #         else:
-    #             self.label_encoder = label_encoder
-    #             self.labels = self.label_encoder.transform(self.data['label'])
+            # Encode labels
+            if label_encoder is None:
+                self.label_encoder = LabelEncoder()
+                self.labels = self.label_encoder.fit_transform(self.data['label'])
+            else:
+                self.label_encoder = label_encoder
+                self.labels = self.label_encoder.transform(self.data['label'])
             
-    #         self.texts = self.data['title'].tolist()
+            self.texts = self.data['title'].tolist()
+            self.max_header_length = max_header_length
             
-    #     def __len__(self):
-    #         return len(self.texts)
+        def __len__(self):
+            return len(self.texts)
         
-    #     def __getitem__(self, idx):
-    #         text = self.texts[idx]
-    #         label = self.labels[idx]
+        def __getitem__(self, idx):
+            text = self.texts[idx]
             
-    #         # Encode single text
-    #         encoding = self.preprocessor.encode_texts(
-    #             [text],
-    #             padding='max_length',
-    #             truncation=True,
-    #             return_tensors='pt'
-    #         )
+            # Truncate header to max_header_length words
+            words = text.split()
+            if len(words) > self.max_header_length:
+                text = " ".join(words[:self.max_header_length])
             
-    #         return {
-    #             'input_ids': encoding['input_ids'].squeeze(0),
-    #             'attention_mask': encoding['attention_mask'].squeeze(0),
-    #             'labels': torch.tensor(label, dtype=torch.long)
-    #         }
-    
-    # print("\n=== Bước 5: Load Dataset ===")
-    
-    # # Khởi tạo preprocessor và model mới
-    # preprocessor_train = PhoBERTTextPreprocessor(
-    #     phobert_model='vinai/phobert-base',
-    #     max_length=128
-    # )
-    
-    # # Load training dataset
-    # train_dataset = VietnameseNewsDataset(
-    #     csv_file='data/preprocess/UIT-ViON_train_preprocessed.csv',
-    #     preprocessor=preprocessor_train
-    # )
-    
-    # # Load validation dataset (sử dụng label_encoder từ train)
-    # val_dataset = VietnameseNewsDataset(
-    #     csv_file='data/preprocess/UIT-ViON_dev_preprocessed.csv',
-    #     preprocessor=preprocessor_train,
-    #     label_encoder=train_dataset.label_encoder
-    # )
-    
-    # print(f"Training samples: {len(train_dataset):,}")
-    # print(f"Validation samples: {len(val_dataset):,}")
-    # print(f"Number of classes: {len(train_dataset.label_encoder.classes_)}")
-    # print(f"Classes: {train_dataset.label_encoder.classes_}")
-    
-    # # =======================
-    # # 2. TẠO DATA LOADERS
-    # # =======================
-    # print("\n=== Bước 6: Tạo DataLoaders ===")
-    
-    # BATCH_SIZE = 16  # Điều chỉnh tùy theo GPU memory
-    # NUM_WORKERS = 2
-    
-    # train_loader = DataLoader(
-    #     train_dataset,
-    #     batch_size=BATCH_SIZE,
-    #     shuffle=True,
-    #     num_workers=NUM_WORKERS,
-    #     pin_memory=True if torch.cuda.is_available() else False
-    # )
-    
-    # val_loader = DataLoader(
-    #     val_dataset,
-    #     batch_size=BATCH_SIZE,
-    #     shuffle=False,
-    #     num_workers=NUM_WORKERS,
-    #     pin_memory=True if torch.cuda.is_available() else False
-    # )
-    
-    # print(f"Training batches: {len(train_loader)}")
-    # print(f"Validation batches: {len(val_loader)}")
-    
-    # # ===========================
-    # # 3. KHỞI TẠO MODEL & TRAINER
-    # # ===========================
-    # print("\n=== Bước 7: Khởi tạo Model & Trainer ===")
-    
-    # # Khởi tạo model
-    # num_classes = len(train_dataset.label_encoder.classes_)
-    # model_train = PhoBERTClassifier(
-    #     num_classes=num_classes,
-    #     phobert_model='vinai/phobert-base',
-    #     dropout_rate=0.3,
-    #     hidden_size=768,
-    #     freeze_phobert=False  # Train cả PhoBERT
-    # )
-    
-    # # Khởi tạo trainer
-    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # print(f"Using device: {device}")
-    
-    # trainer = PhoBERTTrainer(
-    #     model=model_train,
-    #     device=device
-    # )
-    
-    # # ========================
-    # # 4. SETUP OPTIMIZER & LR
-    # # ========================
-    # print("\n=== Bước 8: Setup Optimizer & Learning Rate ===")
-    
-    # from torch.optim import AdamW
-    # from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
-    
-    # # Optimizer
-    # LEARNING_RATE = 2e-5  # Learning rate nhỏ cho fine-tuning PhoBERT
-    # WEIGHT_DECAY = 0.01
-    
-    # optimizer = AdamW(
-    #     model_train.parameters(),
-    #     lr=LEARNING_RATE,
-    #     weight_decay=WEIGHT_DECAY
-    # )
-    
-    # # Learning rate scheduler
-    # NUM_EPOCHS = 5
-    # scheduler = CosineAnnealingLR(
-    #     optimizer,
-    #     T_max=NUM_EPOCHS * len(train_loader)
-    # )
-    
-    # print(f"Learning rate: {LEARNING_RATE}")
-    # print(f"Weight decay: {WEIGHT_DECAY}")
-    # print(f"Number of epochs: {NUM_EPOCHS}")
-    
-    # # ====================
-    # # 5. TRAINING LOOP
-    # # ====================
-    # print("\n=== Bước 9: Bắt đầu Training ===")
-    # print("-" * 60)
-    
-    # best_val_acc = 0.0
-    # history = {
-    #     'train_loss': [],
-    #     'train_acc': [],
-    #     'val_loss': [],
-    #     'val_acc': []
-    # }
-    
-    # for epoch in range(NUM_EPOCHS):
-    #     print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
-    #     print("-" * 40)
-        
-    #     # Training
-    #     train_loss, train_acc = trainer.train_epoch(
-    #         train_loader=train_loader,
-    #         optimizer=optimizer,
-    #         scheduler=scheduler
-    #     )
-        
-    #     # Validation
-    #     val_loss, val_acc = trainer.evaluate(val_loader=val_loader)
-        
-    #     # Save history
-    #     history['train_loss'].append(train_loss)
-    #     history['train_acc'].append(train_acc)
-    #     history['val_loss'].append(val_loss)
-    #     history['val_acc'].append(val_acc)
-        
-    #     # Print results
-    #     print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-    #     print(f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f}")
-        
-    #     # Save best model
-    #     if val_acc > best_val_acc:
-    #         best_val_acc = val_acc
-    #         torch.save({
-    #             'epoch': epoch,
-    #             'model_state_dict': model_train.state_dict(),
-    #             'optimizer_state_dict': optimizer.state_dict(),
-    #             'val_acc': val_acc,
-    #             'label_encoder': train_dataset.label_encoder
-    #         }, 'best_phobert_model.pth')
-    #         print(f"✓ Saved best model with validation accuracy: {val_acc:.4f}")
-    
-    # print("\n" + "="*60)
-    # print("TRAINING HOÀN TẤT!")
-    # print("="*60)
-    # print(f"Best Validation Accuracy: {best_val_acc:.4f}")
-    # print(f"Model đã được lưu tại: best_phobert_model.pth")
-    
-    # # ========================
-    # # 6. TEST PREDICTION
-    # # ========================
-    # print("\n=== Bước 10: Test Prediction ===")
-    
-    # # Load best model
-    # checkpoint = torch.load('best_phobert_model.pth')
-    # model_train.load_state_dict(checkpoint['model_state_dict'])
-    
-    # # Test với một vài samples
-    # test_texts = [
-    #     "ronaldo ghi 2 bàn_thắng trận chung_kết",
-    #     "chính_phủ ban_hành luật mới về thuế",
-    #     "iphone 15 ra_mắt tính_năng mới"
-    # ]
-    
-    # print("\nTest predictions:")
-    # predictions = trainer.predict(
-    #     texts=test_texts,
-    #     preprocessor=preprocessor_train,
-    #     batch_size=8
-    # )
-    
-    # for text, pred_idx in zip(test_texts, predictions):
-    #     pred_label = train_dataset.label_encoder.inverse_transform([pred_idx])[0]
-    #     print(f"Text: {text}")
-    #     print(f"Predicted label: {pred_label}\n")
-    
-    # print("\n=== HOÀN TẤT! ===")
-    # print("""
-    # Để sử dụng model đã train:
-    
-    # 1. Load model:
-    #    checkpoint = torch.load('best_phobert_model.pth')
-    #    model.load_state_dict(checkpoint['model_state_dict'])
-    #    label_encoder = checkpoint['label_encoder']
-    
-    # 2. Predict:
-    #    predictions = trainer.predict(texts, preprocessor)
-    #    labels = label_encoder.inverse_transform(predictions)
-    # """)
+            label = self.labels[idx]
+            
+            # Encode single text
+            encoding = self.preprocessor.encode_texts(
+                [text],
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            
+            return {
+                'input_ids': encoding['input_ids'].squeeze(0),
+                'attention_mask': encoding['attention_mask'].squeeze(0),
+                'labels': torch.tensor(label, dtype=torch.long)
+            }
