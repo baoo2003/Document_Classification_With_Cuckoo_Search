@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
-from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModel
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence, Union
 import os
 from sklearn.preprocessing import LabelEncoder
 import pandas as pd
@@ -137,15 +137,18 @@ class PhoBERTTextPreprocessor:
     def encode_texts(
         self, 
         texts: List[str],
+        text_pairs: Optional[List[Optional[str]]] = None,
         padding: str = 'max_length',
         truncation: bool = True,
         return_tensors: str = 'pt'
     ) -> dict:
         """
-        Encode danh sách văn bản thành tokens
+        Encode danh sách văn bản thành tokens.
+        Hỗ trợ cả input 1 câu (texts) và input 2 câu (texts + text_pairs).
         
         Args:
             texts: Danh sách văn bản đã được tiền xử lý cần encode
+            text_pairs: Danh sách văn bản thứ hai (ví dụ: description). Nếu None -> encode 1 câu.
             padding: Có padding các sequence về cùng độ dài không
             truncation: Có cắt ngắn sequence vượt quá max_length không
             return_tensors: Format output ('pt' cho PyTorch, 'tf' cho TensorFlow)
@@ -154,15 +157,36 @@ class PhoBERTTextPreprocessor:
             Dictionary chứa input_ids, attention_mask
         """
         # Tokenize và encode văn bản đã được tiền xử lý
+        # Với PhoBERT (RoBERTa-like), text_pair sẽ tự động chèn đúng special tokens.
         encoding = self.tokenizer(
             texts,
+            text_pairs,
             max_length=self.max_length,
             padding=padding,
             truncation=truncation,
-            return_tensors=return_tensors
+            return_tensors=return_tensors,
+            return_overflowing_tokens=False,
         )
         
         return encoding
+
+    def encode_title_description(
+        self,
+        titles: List[str],
+        descriptions: List[Optional[str]],
+        padding: str = 'max_length',
+        truncation: bool = True,
+        return_tensors: str = 'pt'
+    ) -> dict:
+        """Convenience wrapper cho input dạng (title, description)."""
+        
+        return self.encode_texts(
+            titles,
+            text_pairs=descriptions,
+            padding=padding,
+            truncation=truncation,
+            return_tensors=return_tensors,
+        )
 
 
 class PhoBERTTrainer:
@@ -174,7 +198,8 @@ class PhoBERTTrainer:
     def __init__(
         self,
         model: PhoBERTClassifier,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        label_smoothing: float = 0.0
     ):
         """
         Khởi tạo trainer
@@ -182,6 +207,7 @@ class PhoBERTTrainer:
         Args:
             model: PhoBERT classifier model
             device: Device để train (mặc định là cuda)
+            label_smoothing: Chỉ số làm mượt nhãn (0.0 - 1.0)
         """
         self.model = model.to(device)
         self.device = device
@@ -193,7 +219,7 @@ class PhoBERTTrainer:
         # Sử dụng CrossEntropyLoss cho bài toán Multi-class (13 classes)
         # Hàm này đã tích hợp sẵn LogSoftmax + NLLLoss
         # Tự động xử lý việc tính Softmax bên trong
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     
     def train_epoch(
         self,
@@ -361,15 +387,17 @@ class PhoBERTTrainer:
 
     def predict(
         self,
-        texts: List[str],
+        texts: Union[List[str], List[Tuple[str, Optional[str]]]],
         preprocessor: PhoBERTTextPreprocessor,
         batch_size: int = 16
     ) -> np.ndarray:
         """
-        Predict labels cho danh sách văn bản
+        Predict labels cho danh sách văn bản.
+        - Nếu `texts` là `List[str]` -> input 1 câu.
+        - Nếu `texts` là `List[Tuple[title, description]]` -> input 2 câu.
         
         Args:
-            texts: Danh sách văn bản cần predict
+            texts: Danh sách văn bản cần predict (1 câu hoặc cặp (title, description))
             preprocessor: PhoBERTTextPreprocessor để encode texts
             batch_size: Batch size cho prediction
             
@@ -378,13 +406,22 @@ class PhoBERTTrainer:
         """
         self.model.eval()
         all_predictions = []
+
+        is_pair_input = len(texts) > 0 and isinstance(texts[0], tuple)
+        if is_pair_input:
+            titles = [t for (t, _) in texts]  # type: ignore[misc]
+            descriptions = [d for (_, d) in texts]  # type: ignore[misc]
+        else:
+            titles = texts  # type: ignore[assignment]
+            descriptions = None
         
         # Process in batches
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
+        for i in range(0, len(titles), batch_size):
+            batch_titles = titles[i:i + batch_size]
+            batch_descriptions = descriptions[i:i + batch_size] if descriptions is not None else None
             
-            # Encode texts
-            encoding = preprocessor.encode_texts(batch_texts)
+            # Encode texts (1 hoặc 2 câu)
+            encoding = preprocessor.encode_texts(batch_titles, text_pairs=batch_descriptions)
             input_ids = encoding['input_ids'].to(self.device)
             attention_mask = encoding['attention_mask'].to(self.device)
             
@@ -400,60 +437,96 @@ class PhoBERTTrainer:
 
 
 class VietnameseNewsDataset(Dataset):
+    """Custom Dataset cho Vietnamese News Classification.
+
+    Input hiện hỗ trợ:
+    - `title` (bắt buộc)
+    - `description` (khuyến nghị; nếu không có sẽ fallback về title-only)
+    - `label`
+    """
+
+    def __init__(
+        self,
+        csv_file: str,
+        preprocessor: PhoBERTTextPreprocessor,
+        label_encoder: Optional[LabelEncoder] = None,
+        max_title_words: int = 20,
+        max_description_words: int = 120,
+        title_col: str = 'title',
+        description_col: str = 'description',
+        label_col: str = 'label',
+    ):
+        """Args:
+        - csv_file: Path đến file CSV
+        - preprocessor: PhoBERTTextPreprocessor để encode texts
+        - label_encoder: LabelEncoder để encode labels (None sẽ tự tạo mới)
+        - max_title_words: Giới hạn số từ của title trước khi tokenize
+        - max_description_words: Giới hạn số từ của description trước khi tokenize
+        - title_col/description_col/label_col: tên cột trong CSV
         """
-        Custom Dataset cho Vietnamese News Classification
-        """
-        def __init__(
-            self, 
-            csv_file: str,
-            preprocessor: PhoBERTTextPreprocessor,
-            label_encoder: Optional[LabelEncoder] = None,
-            max_header_length: int = 20
-        ):
-            """
-            Args:
-                csv_file: Path đến file CSV (có columns: title, label)
-                preprocessor: PhoBERTTextPreprocessor để encode texts
-                label_encoder: LabelEncoder để encode labels (None sẽ tự tạo mới)
-                max_header_length: Độ dài tối đa của header (title) tính theo từ
-            """
-            self.data = pd.read_csv(csv_file)
-            self.preprocessor = preprocessor
-            
-            # Encode labels
-            if label_encoder is None:
-                self.label_encoder = LabelEncoder()
-                self.labels = self.label_encoder.fit_transform(self.data['label'])
-            else:
-                self.label_encoder = label_encoder
-                self.labels = self.label_encoder.transform(self.data['label'])
-            
-            self.texts = self.data['title'].tolist()
-            self.max_header_length = max_header_length
-            
-        def __len__(self):
-            return len(self.texts)
-        
-        def __getitem__(self, idx):
-            text = self.texts[idx]
-            
-            # Truncate header to max_header_length words
-            words = text.split()
-            if len(words) > self.max_header_length:
-                text = " ".join(words[:self.max_header_length])
-            
-            label = self.labels[idx]
-            
-            # Encode single text
-            encoding = self.preprocessor.encode_texts(
-                [text],
-                padding='max_length',
-                truncation=True,
-                return_tensors='pt'
-            )
-            
-            return {
-                'input_ids': encoding['input_ids'].squeeze(0),
-                'attention_mask': encoding['attention_mask'].squeeze(0),
-                'labels': torch.tensor(label, dtype=torch.long)
-            }
+        self.data = pd.read_csv(csv_file)
+        self.preprocessor = preprocessor
+
+        if title_col not in self.data.columns:
+            raise ValueError(f"CSV must contain column '{title_col}'")
+        if label_col not in self.data.columns:
+            raise ValueError(f"CSV must contain column '{label_col}'")
+
+        self.title_col = title_col
+        self.description_col = description_col
+        self.label_col = label_col
+
+        # Encode labels
+        if label_encoder is None:
+            self.label_encoder = LabelEncoder()
+            self.labels = self.label_encoder.fit_transform(self.data[self.label_col])
+        else:
+            self.label_encoder = label_encoder
+            self.labels = self.label_encoder.transform(self.data[self.label_col])
+
+        self.titles = self.data[self.title_col].fillna('').astype(str).tolist()
+        self.descriptions = (
+            self.data[self.description_col].fillna('').astype(str).tolist()
+            if self.description_col in self.data.columns
+            else None
+        )
+
+        self.max_title_words = max_title_words
+        self.max_description_words = max_description_words
+
+    def __len__(self):
+        return len(self.titles)
+
+    @staticmethod
+    def _truncate_words(text: str, max_words: int) -> str:
+        if max_words <= 0:
+            return ''
+        words = text.split()
+        if len(words) > max_words:
+            return " ".join(words[:max_words])
+        return text
+
+    def __getitem__(self, idx):
+        title = self._truncate_words(self.titles[idx], self.max_title_words)
+        description = None
+        if self.descriptions is not None:
+            description = self._truncate_words(self.descriptions[idx], self.max_description_words)
+            if description == '':
+                description = None
+
+        label = int(self.labels[idx])
+
+        # Encode (title, description) nếu có; nếu không thì encode title-only
+        encoding = self.preprocessor.encode_texts(
+            [title],
+            text_pairs=[description] if description is not None else None,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt',
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': torch.tensor(label, dtype=torch.long),
+        }
