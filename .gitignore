@@ -17,3 +17,5 @@ print_result_opt.py
 
 import_data_to_db.py
 thanhnien_articles_topic_sampled.csv
+
+dataset/*

@@ -112,6 +112,68 @@ def prepare_and_save_embeddings(
     joblib.dump(le, f"{save_dir}/label_encoder.joblib")
     print(">> Saved embeddings and texts to", save_dir)
 
+def prepare_and_save_embeddings_v2(
+    csv_path,
+    title_col="title", content_col="content", label_col="topic",
+    batch_size=8, max_length=256,
+    save_dir="models/svm",
+    phase="train",  # "train", "val", "test"
+    encoder_path=None
+):
+    """
+    Chuẩn bị và lưu embedding cho toàn bộ file CSV.
+    - phase='train': fit LabelEncoder mới và lưu.
+    - phase='val' hoặc 'test': load encoder từ train, kiểm tra nhãn hợp lệ.
+    """
+
+    # 1️⃣ Đọc dữ liệu
+    texts, labels = load_data(csv_path, title_col, content_col, label_col)
+    print(f">> Loaded {len(texts)} samples for phase='{phase}'")
+
+    # 2️⃣ Thiết lập encoder
+    os.makedirs(save_dir, exist_ok=True)
+    encoder_file = encoder_path or f"{save_dir}/ViON_label_encoder.joblib"
+
+    if phase == "train":
+        print(">> [TRAIN] Fitting new LabelEncoder...")
+        y, le = encode_labels(labels)
+        joblib.dump(le, encoder_file)
+        print(f">> Saved LabelEncoder to {encoder_file}")
+    else:
+        print(f">> [{phase.upper()}] Loading LabelEncoder from {encoder_file}")
+        if not os.path.exists(encoder_file):
+            raise FileNotFoundError(f"LabelEncoder not found at {encoder_file}")
+        le = joblib.load(encoder_file)
+
+        # Kiểm tra nhãn chưa thấy
+        unseen_labels = set(labels) - set(le.classes_)
+        if unseen_labels:
+            print(f"[WARN] {phase.upper()} set contains unseen labels: {unseen_labels}")
+            # Bỏ qua hoặc thay thế tùy yêu cầu, ở đây ta bỏ qua các mẫu không hợp lệ
+            valid_idx = [i for i, lbl in enumerate(labels) if lbl in le.classes_]
+            labels = [labels[i] for i in valid_idx]
+            texts = [texts[i] for i in valid_idx]
+            print(f">> Filtered {len(valid_idx)} valid samples after removing unseen labels.")
+        y = le.transform(labels)
+
+    # 3️⃣ Sinh embedding
+    print(f">> Embedding {phase} set ({len(texts)} samples)...")
+    X_all = phobert_embed(texts, batch_size=batch_size, max_length=max_length)
+
+    # 4️⃣ Lưu kết quả
+    np.save(f"{save_dir}/ViON_X_{phase}_emb.npy", X_all)
+    np.save(f"{save_dir}/ViON_y_{phase}.npy", y)
+
+    # 5️⃣ Xuất file CSV (để dễ debug)
+    df = pd.DataFrame(X_all)
+    df.insert(0, "label", y)
+    df.insert(0, "text", texts)
+    csv_path_out = f"{save_dir}/ViON_X_{phase}_emb.csv"
+    df.to_csv(csv_path_out, index=False)
+
+    print(f">> Saved embeddings and labels for '{phase}' to {save_dir}")
+    print(f">> CSV preview: {csv_path_out}")
+
 def train_svm_base(
     save_dir="models/svm",
     model_file_name="svm_model",
@@ -123,6 +185,35 @@ def train_svm_base(
     X_test  = np.load(f"{save_dir}/X_test_emb.npy")
     y_test  = np.load(f"{save_dir}/y_test.npy")
     le = joblib.load(f"{save_dir}/label_encoder.joblib")
+
+    X_train = X_train.astype(np.float32)
+    X_test  = X_test.astype(np.float32)
+
+    clf = SVC(kernel=kernel, max_iter=max_iter)
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    print(">> Evaluation:")
+    print(classification_report(y_test, y_pred, target_names=le.classes_))
+
+    joblib.dump(clf, f"{save_dir}/{model_file_name}.joblib")
+    print(f">> Saved SVM model to {save_dir}/{model_file_name}.joblib")
+
+    return clf, le, X_test, y_test
+
+def train_linear_svm(
+    save_dir="models/svm",
+    model_file_name="svm_model",    
+    max_iter=3000
+):    
+    X_train = np.load(f"{save_dir}/X_train_emb.npy")
+    y_train = np.load(f"{save_dir}/y_train.npy")
+    X_test  = np.load(f"{save_dir}/X_test_emb.npy")
+    y_test  = np.load(f"{save_dir}/y_test.npy")
+    le = joblib.load(f"{save_dir}/label_encoder.joblib")
+
+    X_train = X_train.astype(np.float32)
+    X_test  = X_test.astype(np.float32)
 
     clf = SVC(kernel=kernel, max_iter=max_iter)
     clf.fit(X_train, y_train)
@@ -140,12 +231,29 @@ def train_svm_base(
 # 3) Load + Predict tiện dụng
 # =============================
 def load_data(csv_path, title_col="title", content_col="content", label_col="topic"):
+    """
+    Load CSV và tạo danh sách texts, labels.
+    - Nếu có cột content -> nối title + content.
+    - Nếu không có -> chỉ dùng title.
+    """
     df = pd.read_csv(csv_path)
-    if not {title_col, content_col, label_col}.issubset(df.columns):
-        raise ValueError(f"CSV must contain columns: {title_col}, {content_col}, {label_col}")
-    df["text"] = df[title_col].fillna("") + " " + df[content_col].fillna("")
+    
+    # Kiểm tra cột bắt buộc
+    if title_col not in df.columns:
+        raise ValueError(f"CSV must contain column '{title_col}' for titles.")
+    if label_col not in df.columns:
+        raise ValueError(f"CSV must contain column '{label_col}' for labels.")
+    
+    # Kiểm tra xem có content không
+    if content_col in df.columns:
+        df["text"] = df[title_col].fillna("") + " " + df[content_col].fillna("")
+    else:
+        print(f"[INFO] Column '{content_col}' not found — using only '{title_col}' as text.")
+        df["text"] = df[title_col].fillna("")
+    
     texts = df["text"].astype(str).tolist()
     labels = df[label_col].astype(str).tolist()
+    
     return texts, labels
 
 def encode_labels(labels):
@@ -346,7 +454,7 @@ def plot_learning_curve_svm(
 
     ts_abs, train_scores, valid_scores = learning_curve(
         estimator=clf, X=X, y=np.asarray(y_labels), cv=cv,
-        scoring=scoring, train_sizes=train_sizes, n_jobs=-1
+        scoring=scoring, train_sizes=train_sizes, n_jobs=1
     )
 
     tr_m, tr_s = train_scores.mean(axis=1), train_scores.std(axis=1)
