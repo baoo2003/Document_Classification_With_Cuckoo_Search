@@ -80,152 +80,148 @@ def phobert_embed(texts, max_length: int = 256, batch_size: int = 16, l2norm: bo
 def prepare_and_save_embeddings(
     csv_path, 
     title_col="title", content_col="content", label_col="topic",
-    test_size=0.2, random_state=42, batch_size=8, max_length=256,
+    test_size=0.2, random_state=42,
+    batch_size=8, max_length=128,
     save_dir="models/svm"
 ):
+    # 1️⃣ Load dữ liệu
     texts, labels = load_data(csv_path, title_col, content_col, label_col)
 
-    y, le = encode_labels(labels)
+    # labels đã là int64 → dùng trực tiếp
+    y = np.asarray(labels, dtype=np.int64)
 
-    X_train_txt, X_test_txt, y_train, y_test = train_test_split(texts, y, test_size=test_size, random_state=random_state, stratify=y)
+    # 2️⃣ Chia train / test (stratified)
+    X_train_txt, X_test_txt, y_train, y_test = train_test_split(
+        texts,
+        y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y
+    )
 
+    # 3️⃣ Embed bằng PhoBERT
     print(">> Embedding train set...")
-    X_train = phobert_embed(X_train_txt, batch_size=batch_size, max_length=max_length)
-    print(">> Embedding test set...")
-    X_test = phobert_embed(X_test_txt, batch_size=batch_size, max_length=max_length)
+    X_train = phobert_embed(
+        X_train_txt,
+        batch_size=batch_size,
+        max_length=max_length
+    )
 
+    print(">> Embedding test set...")
+    X_test = phobert_embed(
+        X_test_txt,
+        batch_size=batch_size,
+        max_length=max_length
+    )
+
+    # 4️⃣ Lưu embedding + label (chỉ .npy)
     os.makedirs(save_dir, exist_ok=True)
+
     np.save(f"{save_dir}/X_train_emb.npy", X_train)
     np.save(f"{save_dir}/y_train.npy", y_train)
+
     np.save(f"{save_dir}/X_test_emb.npy", X_test)
     np.save(f"{save_dir}/y_test.npy", y_test)
 
-    # Lưu csv có cả text và label
-    df_train = pd.DataFrame(X_train)
-    df_train.insert(0, "label", y_train)
-    df_train.insert(0, "text", X_train_txt)    
-    df_train.to_csv(f"{save_dir}/X_train_emb.csv", index=False)
-    df_test = pd.DataFrame(X_test)
-    df_test.insert(0, "label", y_test)
-    df_test.insert(0, "text", X_test_txt)
-    df_test.to_csv(f"{save_dir}/X_test_emb.csv", index=False)
-    joblib.dump(le, f"{save_dir}/label_encoder.joblib")
-    print(">> Saved embeddings and texts to", save_dir)
+    print(">> Saved embeddings (.npy) to", save_dir)
+    print(f">> Train: {X_train.shape}, Test: {X_test.shape}")
 
 def prepare_and_save_embeddings_v2(
     csv_path,
-    title_col="title", content_col="content", label_col="topic",
-    batch_size=8, max_length=256,
-    save_dir="models/svm",
-    phase="train",  # "train", "val", "test"
-    encoder_path=None
+    title_col="title",
+    content_col="content",
+    label_col="topic",
+    batch_size=8,
+    max_length=128,
+    save_dir="models/svm"
 ):
     """
-    Chuẩn bị và lưu embedding cho toàn bộ file CSV.
-    - phase='train': fit LabelEncoder mới và lưu.
-    - phase='val' hoặc 'test': load encoder từ train, kiểm tra nhãn hợp lệ.
+    Embed toàn bộ dataset (không split).
+    Output:
+        - X_emb.npy : (N, hidden_size)
+        - y.npy     : (N,)
     """
 
-    # 1️⃣ Đọc dữ liệu
+    # 1️⃣ Load dữ liệu
     texts, labels = load_data(csv_path, title_col, content_col, label_col)
-    print(f">> Loaded {len(texts)} samples for phase='{phase}'")
 
-    # 2️⃣ Thiết lập encoder
+    # labels đã là int -> dùng trực tiếp
+    y = np.asarray(labels, dtype=np.int64)
+
+    print(f">> Loaded {len(texts)} samples")
+
+    # 2️⃣ Embed toàn bộ dữ liệu
+    print(">> Embedding full dataset with PhoBERT...")
+    X = phobert_embed(
+        texts,
+        batch_size=batch_size,
+        max_length=max_length
+    )
+
+    # 3️⃣ Lưu
     os.makedirs(save_dir, exist_ok=True)
-    encoder_file = encoder_path or f"{save_dir}/ViON_label_encoder.joblib"
 
-    if phase == "train":
-        print(">> [TRAIN] Fitting new LabelEncoder...")
-        y, le = encode_labels(labels)
-        joblib.dump(le, encoder_file)
-        print(f">> Saved LabelEncoder to {encoder_file}")
-    else:
-        print(f">> [{phase.upper()}] Loading LabelEncoder from {encoder_file}")
-        if not os.path.exists(encoder_file):
-            raise FileNotFoundError(f"LabelEncoder not found at {encoder_file}")
-        le = joblib.load(encoder_file)
+    np.save(f"{save_dir}/X_emb.npy", X)
+    np.save(f"{save_dir}/y.npy", y)
 
-        # Kiểm tra nhãn chưa thấy
-        unseen_labels = set(labels) - set(le.classes_)
-        if unseen_labels:
-            print(f"[WARN] {phase.upper()} set contains unseen labels: {unseen_labels}")
-            # Bỏ qua hoặc thay thế tùy yêu cầu, ở đây ta bỏ qua các mẫu không hợp lệ
-            valid_idx = [i for i, lbl in enumerate(labels) if lbl in le.classes_]
-            labels = [labels[i] for i in valid_idx]
-            texts = [texts[i] for i in valid_idx]
-            print(f">> Filtered {len(valid_idx)} valid samples after removing unseen labels.")
-        y = le.transform(labels)
+    print(">> Saved:")
+    print(f"   X_emb.npy shape: {X.shape}")
+    print(f"   y.npy shape    : {y.shape}")
+    print(">> Done.")
 
-    # 3️⃣ Sinh embedding
-    print(f">> Embedding {phase} set ({len(texts)} samples)...")
-    X_all = phobert_embed(texts, batch_size=batch_size, max_length=max_length)
 
-    # 4️⃣ Lưu kết quả
-    np.save(f"{save_dir}/ViON_X_{phase}_emb.npy", X_all)
-    np.save(f"{save_dir}/ViON_y_{phase}.npy", y)
+# def train_svm_base(
+#     save_dir="models/svm",
+#     model_file_name="svm_model",
+#     kernel="rbf",
+#     max_iter=3000
+# ):    
+#     X_train = np.load(f"{save_dir}/X_train_emb.npy")
+#     y_train = np.load(f"{save_dir}/y_train.npy")
+#     X_test  = np.load(f"{save_dir}/X_test_emb.npy")
+#     y_test  = np.load(f"{save_dir}/y_test.npy")
+#     le = joblib.load(f"{save_dir}/label_encoder.joblib")
 
-    # 5️⃣ Xuất file CSV (để dễ debug)
-    df = pd.DataFrame(X_all)
-    df.insert(0, "label", y)
-    df.insert(0, "text", texts)
-    csv_path_out = f"{save_dir}/ViON_X_{phase}_emb.csv"
-    df.to_csv(csv_path_out, index=False)
+#     X_train = X_train.astype(np.float32)
+#     X_test  = X_test.astype(np.float32)
 
-    print(f">> Saved embeddings and labels for '{phase}' to {save_dir}")
-    print(f">> CSV preview: {csv_path_out}")
+#     clf = SVC(kernel=kernel, max_iter=max_iter)
+#     clf.fit(X_train, y_train)
 
-def train_svm_base(
-    save_dir="models/svm",
-    model_file_name="svm_model",
-    kernel="rbf",
-    max_iter=3000
-):    
-    X_train = np.load(f"{save_dir}/X_train_emb.npy")
-    y_train = np.load(f"{save_dir}/y_train.npy")
-    X_test  = np.load(f"{save_dir}/X_test_emb.npy")
-    y_test  = np.load(f"{save_dir}/y_test.npy")
-    le = joblib.load(f"{save_dir}/label_encoder.joblib")
+#     y_pred = clf.predict(X_test)
+#     print(">> Evaluation:")
+#     print(classification_report(y_test, y_pred, target_names=le.classes_))
 
-    X_train = X_train.astype(np.float32)
-    X_test  = X_test.astype(np.float32)
+#     joblib.dump(clf, f"{save_dir}/{model_file_name}.joblib")
+#     print(f">> Saved SVM model to {save_dir}/{model_file_name}.joblib")
 
-    clf = SVC(kernel=kernel, max_iter=max_iter)
-    clf.fit(X_train, y_train)
+#     return clf, le, X_test, y_test
 
-    y_pred = clf.predict(X_test)
-    print(">> Evaluation:")
-    print(classification_report(y_test, y_pred, target_names=le.classes_))
+# def train_linear_svm(
+#     save_dir="models/svm",
+#     model_file_name="svm_model",    
+#     max_iter=3000
+# ):    
+#     X_train = np.load(f"{save_dir}/X_train_emb.npy")
+#     y_train = np.load(f"{save_dir}/y_train.npy")
+#     X_test  = np.load(f"{save_dir}/X_test_emb.npy")
+#     y_test  = np.load(f"{save_dir}/y_test.npy")
+#     le = joblib.load(f"{save_dir}/label_encoder.joblib")
 
-    joblib.dump(clf, f"{save_dir}/{model_file_name}.joblib")
-    print(f">> Saved SVM model to {save_dir}/{model_file_name}.joblib")
+#     X_train = X_train.astype(np.float32)
+#     X_test  = X_test.astype(np.float32)
 
-    return clf, le, X_test, y_test
+#     clf = SVC(kernel=kernel, max_iter=max_iter)
+#     clf.fit(X_train, y_train)
 
-def train_linear_svm(
-    save_dir="models/svm",
-    model_file_name="svm_model",    
-    max_iter=3000
-):    
-    X_train = np.load(f"{save_dir}/X_train_emb.npy")
-    y_train = np.load(f"{save_dir}/y_train.npy")
-    X_test  = np.load(f"{save_dir}/X_test_emb.npy")
-    y_test  = np.load(f"{save_dir}/y_test.npy")
-    le = joblib.load(f"{save_dir}/label_encoder.joblib")
+#     y_pred = clf.predict(X_test)
+#     print(">> Evaluation:")
+#     print(classification_report(y_test, y_pred, target_names=le.classes_))
 
-    X_train = X_train.astype(np.float32)
-    X_test  = X_test.astype(np.float32)
+#     joblib.dump(clf, f"{save_dir}/{model_file_name}.joblib")
+#     print(f">> Saved SVM model to {save_dir}/{model_file_name}.joblib")
 
-    clf = SVC(kernel=kernel, max_iter=max_iter)
-    clf.fit(X_train, y_train)
-
-    y_pred = clf.predict(X_test)
-    print(">> Evaluation:")
-    print(classification_report(y_test, y_pred, target_names=le.classes_))
-
-    joblib.dump(clf, f"{save_dir}/{model_file_name}.joblib")
-    print(f">> Saved SVM model to {save_dir}/{model_file_name}.joblib")
-
-    return clf, le, X_test, y_test
+#     return clf, le, X_test, y_test
 
 # =============================
 # 3) Load + Predict tiện dụng
@@ -246,7 +242,7 @@ def load_data(csv_path, title_col="title", content_col="content", label_col="top
     
     # Kiểm tra xem có content không
     if content_col in df.columns:
-        df["text"] = df[title_col].fillna("") + " " + df[content_col].fillna("")
+        df["text"] = df[title_col].fillna("") + " </s> " + df[content_col].fillna("")
     else:
         print(f"[INFO] Column '{content_col}' not found — using only '{title_col}' as text.")
         df["text"] = df[title_col].fillna("")
@@ -342,104 +338,183 @@ def embed_and_save_simple(
 # 4) Visualization (matplotlib)
 # =============================
 def evaluate_confusion_matrix(
-    clf, le,
-    X_emb=None,               # ưu tiên: embedding đã lưu
-    X_texts=None,             # fallback: text (sẽ embed)
-    y_true_labels=None,       # y_true có thể là int hoặc tên lớp
-    batch_size: int = 8, max_length: int = 256,
-    normalize: bool = False, figsize=(10, 8),
-    title: str = "Confusion Matrix"
+    clf,
+    X_emb=None,                 # embedding đã lưu
+    X_texts=None,               # fallback: text (sẽ embed)
+    y_true_labels=None,         # y_true PHẢI là int
+    batch_size: int = 8,
+    max_length: int = 128,
+    normalize: bool = False,
+    figsize=(10, 8),
+    title: str = "Ma trận nhầm lẫn",
+    label_names: List[str] = None
 ):
     if y_true_labels is None:
-        raise ValueError("Cần truyền y_true_labels (int hoặc tên lớp).")
+        raise ValueError("Cần truyền y_true_labels (int).")
 
-    # Chuẩn hóa y_true
-    if isinstance(y_true_labels[0], str):
-        y_true = le.transform(y_true_labels)
-    else:
-        y_true = np.asarray(y_true_labels)
+    # Ép kiểu int
+    y_true = np.asarray(y_true_labels, dtype=np.int64)
 
-    X = _ensure_embeddings(X_emb=X_emb, X_texts=X_texts,
-                           batch_size=batch_size, max_length=max_length)
+    # Lấy embedding
+    X = _ensure_embeddings(
+        X_emb=X_emb,
+        X_texts=X_texts,
+        batch_size=batch_size,
+        max_length=max_length
+    )
 
+    # Dự đoán
     y_pred = clf.predict(X)
-    cm = confusion_matrix(y_true, y_pred, normalize='true' if normalize else None)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=le.classes_)
+
+    # Confusion matrix
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        normalize="true" if normalize else None
+    )
+
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=cm,
+        display_labels=label_names
+    )
+
     fig, ax = plt.subplots(figsize=figsize)
-    disp.plot(ax=ax, cmap="Blues", xticks_rotation=45, values_format=".2f" if normalize else "d")
-    ax.set_title(title + (" (normalized)" if normalize else ""))
+    disp.plot(
+        ax=ax,
+        cmap="Blues",
+        xticks_rotation=45,
+        values_format=".2f" if normalize else "d"
+    )
+
+    ax.set_title(title + (" (chuẩn hóa)" if normalize else ""))
     plt.tight_layout()
     plt.show()
 
-def _prepare_vis_samples(texts, labels, le, max_points: int = 2000, random_state: int = 42):
+def _prepare_vis_samples(
+    texts,
+    labels,
+    max_points: int = 2000,
+    random_state: int = 42
+):
     """
     Lấy mẫu gọn để vẽ (tránh quá nặng).
-    Trả về: texts_s, y_s (int).
+    labels PHẢI là int.
+    Trả về: texts_s, y_s (int)
     """
     rng = np.random.RandomState(random_state)
     n = len(texts)
     idx = np.arange(n)
+
     if n > max_points:
         idx = rng.choice(n, size=max_points, replace=False)
-    texts_s = [texts[i] for i in idx]
 
-    # labels có thể là int hoặc str; convert về int theo le
-    if isinstance(labels[0], str):
-        y_s = le.transform([labels[i] for i in idx])
-    else:
-        y_s = np.asarray([labels[i] for i in idx], dtype=int)
+    texts_s = [texts[i] for i in idx]
+    y_s = np.asarray([labels[i] for i in idx], dtype=int)
+
     return texts_s, y_s
 
+
 def plot_umap_embeddings(
-    texts=None, labels=None, le=None,
-    X_emb=None, y_int=None,                    # dùng cặp này nếu có sẵn
-    batch_size: int = 8, max_length: int = 256,
-    max_points: int = 4000, n_neighbors: int = 15, min_dist: float = 0.1,
-    figsize=(8, 6), random_state: int = 42, title: str = "UMAP of PhoBERT embeddings"
+    texts=None,
+    labels=None,                          # int
+    X_emb=None,
+    y_int=None,                           # int
+    label_names: List[str] = None,        # <-- MỚI
+    batch_size: int = 8,
+    max_length: int = 128,
+    max_points: int = 4000,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+    figsize=(8, 6),
+    random_state: int = 42,
+    title: str = "UMAP biểu diễn embedding PhoBERT"
 ):
     try:
         import umap
     except Exception as e:
         raise RuntimeError("UMAP chưa được cài. Chạy: pip install umap-learn") from e
 
-    # Nếu đã có embedding & y_int: ưu tiên dùng trực tiếp (và xuống mẫu nếu quá lớn)
+    if label_names is None:
+        raise ValueError("Cần truyền label_names (List[str]).")
+
+    # =========================
+    # 1️⃣ Lấy embedding & label
+    # =========================
     if X_emb is not None and y_int is not None:
         X_all = X_emb
         y_all = np.asarray(y_int, dtype=int)
+
         n = len(y_all)
         rng = np.random.RandomState(random_state)
         idx = np.arange(n)
         if n > max_points:
             idx = rng.choice(n, size=max_points, replace=False)
+
         X = X_all[idx]
         y_s = y_all[idx]
-    else:
-        # Dùng texts/labels + embed tại đây
-        if texts is None or labels is None or le is None:
-            raise ValueError("Cần (texts, labels, le) hoặc (X_emb, y_int).")
-        texts_s, y_s = _prepare_vis_samples(texts, labels, le, max_points, random_state)
-        X = phobert_embed(texts_s, batch_size=batch_size, max_length=max_length)
 
+    else:
+        if texts is None or labels is None:
+            raise ValueError("Cần (texts, labels) hoặc (X_emb, y_int).")
+
+        texts_s, y_s = _prepare_vis_samples(
+            texts, labels,
+            max_points=max_points,
+            random_state=random_state
+        )
+
+        X = phobert_embed(
+            texts_s,
+            batch_size=batch_size,
+            max_length=max_length
+        )
+
+    # =========================
+    # 2️⃣ UMAP
+    # =========================
     reducer = umap.UMAP(
-        n_neighbors=n_neighbors, min_dist=min_dist, n_components=2,
-        random_state=random_state, metric="cosine",
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        n_components=2,
+        random_state=random_state,
+        metric="cosine",
     )
+
     coords = reducer.fit_transform(X)
 
+    # =========================
+    # 3️⃣ Plot
+    # =========================
     plt.figure(figsize=figsize)
+
     classes = np.unique(y_s)
     for cls in classes:
-        m = (y_s == cls)
-        label = le.inverse_transform([cls])[0] if le is not None else str(cls)
-        plt.scatter(coords[m, 0], coords[m, 1], s=8, alpha=0.7, label=label)
-    plt.legend(loc="best", fontsize=8, markerscale=2)
+        mask = (y_s == cls)
+        label = label_names[cls] if cls < len(label_names) else f"Lớp {cls}"
+
+        plt.scatter(
+            coords[mask, 0],
+            coords[mask, 1],
+            s=8,
+            alpha=0.7,
+            label=label
+        )
+
+    plt.legend(
+        loc="best",
+        fontsize=8,
+        markerscale=2,
+        frameon=True
+    )
     plt.title(title)
-    plt.xlabel("UMAP 1"); plt.ylabel("UMAP 2")
-    plt.tight_layout(); plt.show()
+    plt.xlabel("UMAP 1")
+    plt.ylabel("UMAP 2")
+    plt.tight_layout()
+    plt.show()
 
 def plot_learning_curve_svm(
     clf, X_emb=None, X_texts=None, y_labels=None,
-    batch_size: int = 8, max_length: int = 256,
+    batch_size: int = 8, max_length: int = 128,
     cv: int = 5, train_sizes=np.linspace(0.1, 1.0, 5),
     scoring: str = "f1_macro", figsize=(8, 6),
     title: str = "Learning Curve (SVM on PhoBERT embeddings)"

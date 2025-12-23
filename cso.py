@@ -67,7 +67,7 @@ class CSO:
         self.X = []
 
         if bound is not None:
-            for (U, L) in bound:
+            for (L, U) in bound:
                 x = (U-L)*np.random.rand(P,) + L 
                 self.X.append(x)
             self.X = np.array(self.X).T
