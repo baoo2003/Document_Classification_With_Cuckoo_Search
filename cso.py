@@ -105,9 +105,9 @@ class CSO:
 
         '''
 
-        num = gamma(1+self.beta)*np.sin(np.pi*self.beta/2)
-        den = gamma((1+self.beta)/2)*self.beta*(2**((self.beta-1)/2))
-        σu = (num/den)**(1/self.beta)
+        num = gamma(1+self.beta)*np.sin(np.pi*self.beta/2)   # ~ 0.94 with beta=1.5
+        den = gamma((1+self.beta)/2)*self.beta*(2**((self.beta-1)/2)) # ~ 1.617 with beta=1.5
+        σu = (num/den)**(1/self.beta) # ~ 0.6966 with beta=1.5
         σv = 1
         u = np.random.normal(0, σu, self.n)
         v = np.random.normal(0, σv, self.n)
